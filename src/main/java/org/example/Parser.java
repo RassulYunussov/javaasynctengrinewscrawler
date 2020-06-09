@@ -8,6 +8,7 @@ import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
 import org.apache.http.impl.nio.client.HttpAsyncClients;
 import org.apache.http.util.EntityUtils;
 
+import javax.xml.transform.stream.StreamSource;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
@@ -20,51 +21,49 @@ import static java.util.stream.Collectors.toList;
 
 public class Parser {
     private CloseableHttpAsyncClient client = HttpAsyncClients.createDefault();
-    private ConcurrentHashMap<String,Page> pages = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<String, Page> pages = new ConcurrentHashMap<>();
+    private ExecutorService executor = Executors. newCachedThreadPool();
 
     public void crawlUrls(Iterable<String> urls) throws IOException, InterruptedException, ExecutionException {
         client.start();
         crawl(urls);
         client.close();
     }
-    private Integer crawl(Iterable<String> Urls) {
 
-        Map<String, Future<HttpResponse>> futures = new HashMap<>();
-        for (var url : Urls) {
-            if (!pages.containsKey(url)) {
-                HttpGet request = new HttpGet(url);
-                futures.put(url, client.execute(request, null));
-            }
-        }
-        List<CompletableFuture<Integer>> subUrls = new ArrayList<CompletableFuture<Integer>>();
-        while (futures.size() > 0) {
-            for (var kvp : futures.entrySet()) {
-                try {
-                    var response = kvp.getValue().get(1000, TimeUnit.MILLISECONDS);
-
-                    HttpEntity entity = response.getEntity();
-                    String responseString = EntityUtils.toString(entity, "UTF-8");
-
-                    Page p = new Page(kvp.getKey(), responseString);
-                    if(pages.putIfAbsent(kvp.getKey(),p)==null) {
-                        var urls = getUrls(p);
-                        System.out.println(pages.size());
-                        subUrls.add(CompletableFuture.supplyAsync(() -> crawl(urls)));
-                    }
-                    futures.remove(kvp.getKey());
-                    break;
-                } catch (Exception e) {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException interruptedException) {
-                        interruptedException.printStackTrace();
-                    }
+    private CompletableFuture<Void> processHttpResponse(String url, Future<HttpResponse> futureResponse)
+    {
+        try
+        {
+            var response = futureResponse.get();
+            HttpEntity entity = response.getEntity();
+            String responseString = null;
+            try {
+                responseString = EntityUtils.toString(entity, "UTF-8");
+                Page p = new Page(url, responseString);
+                if (pages.putIfAbsent(url, p) == null) {
+                    System.out.println(url);
+                    System.out.println(pages.size());
+                    return CompletableFuture.supplyAsync(() -> crawl(getUrls(p)), executor);
                 }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (ExecutionException e) {
+            e.printStackTrace();
         }
-        CompletableFuture[] cfs = subUrls.toArray(new CompletableFuture[futures.size()]);
-        CompletableFuture.allOf(cfs).join();
-        return 0;
+        return CompletableFuture.supplyAsync(()->crawl(List.of()), executor);
+    }
+    private Void crawl(Iterable<String> Urls) {
+        var result = StreamSupport.stream(Urls.spliterator(),false)
+                      .map(url->new Object [] {url, client.execute(new HttpGet(url), null)})
+                      .collect(toList())
+                      .parallelStream()
+                      .map(tuple->processHttpResponse((String)tuple[0],(Future<HttpResponse>)tuple[1]))
+                      .toArray(size-> new CompletableFuture[size]);
+        CompletableFuture.allOf(result).join();
+        return null;
     }
     private Iterable<String> getUrls(Page p)
     {
